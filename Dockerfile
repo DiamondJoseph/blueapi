@@ -38,9 +38,12 @@ RUN git remote set-url origin git@github.com:DiamondLightSource/blueapi.git
 
 
 # For this pod to understand finding user information from LDAP
-RUN apt update
-RUN DEBIAN_FRONTEND=noninteractive apt install libnss-ldapd -y
-RUN sed -i 's/files/ldap files/g' /etc/nsswitch.conf
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+    # gdb required for attaching debugger
+    gdb \
+    # May be required if attaching devcontainer
+    libnss-ldapd \
+    RUN sed -i 's/files/ldap files/g' /etc/nsswitch.conf
 
 # Make editable and debuggable
 RUN pip install debugpy
@@ -48,21 +51,22 @@ RUN pip install -e .
 
 RUN groupadd -g 1000 blueapi && \
     useradd -m -u 1000 -g blueapi blueapi
- 
+
 # Switch to the custom user
 USER blueapi
 
 # Alternate entrypoint to allow devcontainer to attach
-ENTRYPOINT [ "/bin/bash", "-c", "--" ]
-CMD [ "while true; do sleep 30; done;" ]
-
+ENTRYPOINT ["python", "-Xfrozen_modules=off", "-m", "debugpy", "--listen", "0.0.0.0:5678", "--configure-subProcess", "true", "-m", "blueapi"]
+CMD ["serve"]
 
 # The runtime stage copies the built venv into a slim runtime container
 FROM python:${PYTHON_VERSION}-slim AS runtime
 # Add apt-get system dependecies for runtime here if needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
     # Git required for installing packages at runtime
     git \
+    # May be required if attaching devcontainer
+    libnss-ldapd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build --chmod=o+wrX /venv/ /venv/
 COPY --from=build --chmod=o+wrX /.cache/pip /.cache/pip
@@ -70,8 +74,6 @@ ENV PATH=/venv/bin:$PATH
 ENV PYTHONPYCACHEPREFIX=/tmp/blueapi_pycache
 
 # For this pod to understand finding user information from LDAP
-RUN apt update
-RUN DEBIAN_FRONTEND=noninteractive apt install libnss-ldapd -y
 RUN sed -i 's/files/ldap files/g' /etc/nsswitch.conf
 
 # Set the MPLCONFIGDIR environment variable to a temporary directory to avoid
@@ -83,7 +85,7 @@ ENV MPLCONFIGDIR=/tmp/matplotlib
 
 RUN groupadd -g 1000 blueapi && \
     useradd -m -u 1000 -g blueapi blueapi
- 
+
 # Switch to the custom user
 USER blueapi
 

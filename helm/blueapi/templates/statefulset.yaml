@@ -72,7 +72,7 @@ spec:
           type: Directory
       {{- end }}
       {{- end }}
-      {{- if or .Values.debug.enabled (and .Values.initContainer.enabled .Values.initContainer.persistentVolume.enabled)}}
+      {{- if ne 1000.0 .Values.securityContext.runAsUser }}
       - name: home  # Required for vscode to install plugins
         emptyDir:
           sizeLimit: 500Mi
@@ -95,6 +95,7 @@ spec:
             if [ $? -ne 0 ]; then echo 'Blueapi failed'; exit 1; fi;
             echo "Exporting venv as artefact"
             cp -r /venv/* /artefacts
+            {{if .Values.initContainer.persistentVolume.enabled }}chmod o+wrX -R {{ .Values.worker.scratch.root }}{{- end}}
         volumeMounts:
           - name: init-config
             mountPath: "/config"
@@ -151,13 +152,20 @@ spec:
             - name: venv
               mountPath: /venv
             {{- end }}
-            {{- if or .Values.debug.enabled (and .Values.initContainer.enabled .Values.initContainer.persistentVolume.enabled) }}
+            {{- if ne 1000.0 .Values.securityContext.runAsUser }}
             - mountPath: /home
               name: home
             - mountPath: /var/run/nslcd
               name: nslcd
             {{- end }}
-          {{- if not .Values.debug.enabled }}
+          {{- if and .Values.debug.enabled .Values.debug.suspend }}
+          command:
+          - "/bin/bash"
+          - "-c"
+          - "--"
+          args:
+          - "while true; do sleep 30; done;"
+          {{- else }}
           args:
             - "-c"
             - "/config/config.yaml"
@@ -180,7 +188,7 @@ spec:
                 name: {{ include "blueapi.fullname" . }}-otel-config
           env:
             {{- toYaml .Values.extraEnvVars | nindent 12 }}
-        {{- if or .Values.debug.enabled (and .Values.initContainer.persistentVolume.enabled .Values.initContainer.enabled )}}
+        {{- if ne 1000.0 .Values.securityContext.runAsUser }}
         - name: debug-account-sync
           image: ghcr.io/diamondlightsource/account-sync-sidecar:3.0.0
           volumeMounts:

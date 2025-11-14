@@ -11,6 +11,34 @@
                 "cwd": "${workspaceRoot}"
             },
             "problemMatcher": [],
+        },
+        {
+            "type": "shell",
+            "label": "kubectl port-forward",
+            "command": "kubectl",
+            "args": [
+                "port-forward",
+                "-n",
+                "${input:namespace}",
+                "${input:pod}",
+                "5678",
+                "&"
+            ],
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "namespace",
+            "type": "promptString",
+            "description": "Beamline namespace in the cluster",
+            "default": "ixx-beamline"
+        },
+        {
+            "id": "pod",
+            "type": "promptString",
+            "description": "Blueapi pod name",
+            "default": "ixx-blueapi-0",
         }
     ]
 }
