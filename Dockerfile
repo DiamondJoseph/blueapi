@@ -15,7 +15,7 @@ RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/s
     chmod 700 get_helm.sh; \
     ./get_helm.sh; \
     rm get_helm.sh
-RUN helm plugin install https://github.com/losisin/helm-values-schema-json.git --version 2.2.1
+RUN helm plugin install https://github.com/losisin/helm-values-schema-json.git
 
 # Set up a virtual environment and put it in PATH
 RUN python -m venv /venv
@@ -27,37 +27,7 @@ RUN mkdir -p /.cache/pip; chmod o+wrX /.cache/pip
 # Requires buildkit 0.17.0
 COPY --chmod=o+wrX . /workspaces/blueapi
 WORKDIR /workspaces/blueapi
-RUN touch dev-requirements.txt && pip install --upgrade pip && pip install -c dev-requirements.txt .
-
-
-FROM build AS debug
-
-
-# Set origin to use ssh
-RUN git remote set-url origin git@github.com:DiamondLightSource/blueapi.git
-
-
-# For this pod to understand finding user information from LDAP
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
-    # gdb required for attaching debugger
-    gdb \
-    # May be required if attaching devcontainer
-    libnss-ldapd \
-    RUN sed -i 's/files/ldap files/g' /etc/nsswitch.conf
-
-# Make editable and debuggable
-RUN pip install debugpy
-RUN pip install -e .
-
-RUN groupadd -g 1000 blueapi && \
-    useradd -m -u 1000 -g blueapi blueapi
-
-# Switch to the custom user
-USER blueapi
-
-# Alternate entrypoint to allow devcontainer to attach
-ENTRYPOINT ["python", "-Xfrozen_modules=off", "-m", "debugpy", "--listen", "0.0.0.0:5678", "--configure-subProcess", "true", "-m", "blueapi"]
-CMD ["serve"]
+RUN touch dev-requirements.txt && pip install --upgrade pip && pip install debugpy && pip install -c dev-requirements.txt .
 
 # The runtime stage copies the built venv into a slim runtime container
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -65,11 +35,15 @@ FROM python:${PYTHON_VERSION}-slim AS runtime
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
     # Git required for installing packages at runtime
     git \
+    # gdb required for attaching debugger
+    gdb \
     # May be required if attaching devcontainer
     libnss-ldapd \
     && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build --chmod=o+wrX /venv/ /venv/
 COPY --from=build --chmod=o+wrX /.cache/pip /.cache/pip
+
 ENV PATH=/venv/bin:$PATH
 ENV PYTHONPYCACHEPREFIX=/tmp/blueapi_pycache
 

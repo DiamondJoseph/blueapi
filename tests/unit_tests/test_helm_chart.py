@@ -643,42 +643,6 @@ def test_ldap_account_sync_exists_for_non_default_user(run_as_user: int | None):
 @pytest.mark.parametrize("persistent_volume_enabled", [True, False])
 @pytest.mark.parametrize("existing_claim_name", [None, "foo"])
 @pytest.mark.parametrize("debug_enabled", [True, False])
-def test_container_image_has_debug_suffix(
-    init_container_enabled: bool,
-    persistent_volume_enabled: bool,
-    existing_claim_name: str | None,
-    debug_enabled: bool,
-):
-    manifests = render_persistent_volume_chart(
-        init_container_enabled,
-        persistent_volume_enabled,
-        existing_claim_name,
-        debug_enabled,
-    )
-
-    if debug_enabled:
-        image = manifests["StatefulSet"]["blueapi"]["spec"]["template"]["spec"][
-            "containers"
-        ][0]["image"]
-        assert str(image).endswith("-debug")
-
-    else:
-        image = manifests["StatefulSet"]["blueapi"]["spec"]["template"]["spec"][
-            "containers"
-        ][0]["image"]
-        assert not str(image).endswith("-debug")
-
-    if init_container_enabled:
-        init_image = manifests["StatefulSet"]["blueapi"]["spec"]["template"]["spec"][
-            "initContainers"
-        ][0]["image"]
-        assert init_image == image
-
-
-@pytest.mark.parametrize("init_container_enabled", [True, False])
-@pytest.mark.parametrize("persistent_volume_enabled", [True, False])
-@pytest.mark.parametrize("existing_claim_name", [None, "foo"])
-@pytest.mark.parametrize("debug_enabled", [True, False])
 def test_main_container_scratch_mount(
     init_container_enabled: bool,
     persistent_volume_enabled: bool,
@@ -771,16 +735,32 @@ def test_main_container_args(
     main_container = manifests["StatefulSet"]["blueapi"]["spec"]["template"]["spec"][
         "containers"
     ][0]
-    if debug_enabled and debug_suspend:
-        assert main_container["command"] == ["/bin/bash", "-c", "--"]
-        assert main_container["args"] == ["while true; do sleep 30; done;"]
 
-    else:
-        assert main_container["args"] == [
-            "-c",
-            "/config/config.yaml",
-            "serve",
+    assert main_container["args"] == [
+        "-c",
+        "/config/config.yaml",
+        "serve",
+    ]
+
+    if debug_enabled:
+        expected_command = [
+            "python",
+            "-Xfrozen_modules=off",
+            "-m",
+            "debugpy",
+            "--listen",
+            "0.0.0.0:5678",
+            "--configure-subProcess",
+            "true",
+            "-m",
+            "blueapi",
         ]
+
+        if debug_suspend:
+            expected_command.insert(5, "--wait-for-client")
+
+        assert main_container["command"] == expected_command
+    else:
         assert "command" not in main_container
 
 

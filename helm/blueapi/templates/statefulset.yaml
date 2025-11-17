@@ -83,7 +83,7 @@ spec:
       {{- if .Values.initContainer.enabled }}
       initContainers:
       - name: setup-scratch
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{ ternary "-debug" "" .Values.debug.enabled }}"
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         resources:
           {{- .Values.initResources | default .Values.resources | toYaml | nindent 12 }}
@@ -117,7 +117,7 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{ ternary "-debug" "" .Values.debug.enabled }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -158,18 +158,25 @@ spec:
             - mountPath: /var/run/nslcd
               name: nslcd
             {{- end }}
-          {{- if and .Values.debug.enabled .Values.debug.suspend }}
-          command:
-          - "/bin/bash"
-          - "-c"
-          - "--"
-          args:
-          - "while true; do sleep 30; done;"
-          {{- else }}
           args:
             - "-c"
             - "/config/config.yaml"
             - "serve"
+          {{- if .Values.debug.enabled }}
+          command:
+          - "python"
+          - "-Xfrozen_modules=off"
+          - "-m"
+          - "debugpy"
+          - "--listen"
+          {{- if .Values.debug.suspend }}
+          - "--wait-for-client"
+          {{- end }}
+          - "0.0.0.0:5678"
+          - "--configure-subProcess"
+          - "true"
+          - "-m"
+          - "blueapi"
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
