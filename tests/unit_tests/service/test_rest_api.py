@@ -19,9 +19,13 @@ from starlette.types import Message, Receive, Scope, Send
 from blueapi.config import (
     ApplicationConfig,
     CORSConfig,
+    DeviceManagerSource,
+    EnvironmentConfig,
     OIDCConfig,
+    PlanSource,
     RestConfig,
 )
+from blueapi.core.context import BlueskyContext
 from blueapi.service import interface, main
 from blueapi.service.authorization import OpaUserClient, opa
 from blueapi.service.interface import (
@@ -256,6 +260,101 @@ def test_get_devices(mock_runner: Mock, client: TestClient) -> None:
                 "protocols": [{"name": "Stoppable", "types": []}],
             }
         ]
+    }
+
+
+GENERIC_MODULE = "tests.unit_tests.core.fake_generic_module"
+MOVABLE = "bluesky.protocols.Movable"
+
+
+@pytest.fixture
+def client_with_generic_devices(
+    mock_runner: Mock, client: TestClient
+) -> Iterator[TestClient]:
+    """Client of a server that has loaded the devices and plans of a module"""
+    config = ApplicationConfig(
+        env=EnvironmentConfig(
+            sources=[
+                DeviceManagerSource(module=GENERIC_MODULE),
+                PlanSource(module=GENERIC_MODULE),
+            ]
+        )
+    )
+    # Call the interface in this process, where it would be in the subprocess
+    mock_runner.run.side_effect = lambda function, *args, **kwargs: function(
+        *args, **kwargs
+    )
+    with patch(
+        "blueapi.service.interface.context", return_value=BlueskyContext(config)
+    ):
+        yield client
+
+
+def test_get_devices_that_declare_type_arguments(
+    client_with_generic_devices: TestClient,
+) -> None:
+    response = client_with_generic_devices.get("/devices")
+
+    assert response.status_code == status.HTTP_200_OK
+    movable_types = {
+        device["name"]: protocol["types"]
+        for device in response.json()["devices"]
+        for protocol in device["protocols"]
+        if protocol["name"] == "Movable"
+    }
+    assert movable_types == {
+        "undeclared_mover": [],
+        "any_mover": ["Any"],
+        "bool_mover": ["bool"],
+        "int_mover": ["int"],
+        "str_mover": ["str"],
+        "int_or_str_mover": ["int | str"],
+        "object_mover": ["object"],
+    }
+
+
+def test_get_plans_that_ask_for_type_arguments(
+    client_with_generic_devices: TestClient,
+) -> None:
+    response = client_with_generic_devices.get("/plans")
+
+    assert response.status_code == status.HTTP_200_OK
+    movers = {
+        plan["name"]: plan["schema"]["properties"]["mover"]
+        for plan in response.json()["plans"]
+    }
+    takes_anything = ["any_mover", "object_mover", "undeclared_mover"]
+    takes_both = sorted([*takes_anything, "int_or_str_mover"])
+    takes_int = sorted([*takes_both, "int_mover"])
+    takes_str = sorted([*takes_both, "str_mover"])
+    everything = sorted({"bool_mover", *takes_int, *takes_str})
+    assert movers == {
+        "needs_mover": {"title": "Mover", "type": MOVABLE, "enum": everything},
+        "needs_any_mover": {
+            "title": "Mover",
+            "type": MOVABLE,
+            "types": ["typing.Any"],
+            "enum": takes_anything,
+        },
+        "needs_int_mover": {
+            "title": "Mover",
+            "type": MOVABLE,
+            "types": ["int"],
+            "enum": takes_int,
+        },
+        "needs_int_mover_or_str_mover": {
+            "title": "Mover",
+            "anyOf": [
+                {"type": MOVABLE, "types": ["int"], "enum": takes_int},
+                {"type": MOVABLE, "types": ["str"], "enum": takes_str},
+            ],
+        },
+        "needs_int_or_str_mover": {
+            "title": "Mover",
+            "type": MOVABLE,
+            "types": ["int | str"],
+            "enum": takes_both,
+        },
     }
 
 

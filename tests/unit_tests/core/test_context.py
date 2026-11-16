@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from inspect import Parameter
 from pathlib import Path
-from types import ModuleType, NoneType
+from types import GenericAlias, ModuleType, NoneType, new_class
 from typing import Any, Generic, TypeVar, Union, get_args, get_type_hints
 from unittest.mock import MagicMock, Mock, patch
 
@@ -15,6 +15,7 @@ from bluesky.protocols import (
     Movable,
     Readable,
     Reading,
+    Status,
     Stoppable,
     SyncOrAsync,
 )
@@ -38,6 +39,13 @@ from ophyd_async.sim import SimMotor
 from pydantic import TypeAdapter, ValidationError
 from pydantic.json_schema import SkipJsonSchema
 from pytest import LogCaptureFixture
+from tests.unit_tests.core.fake_generic_module import (
+    needs_any_mover,
+    needs_int_mover,
+    needs_int_mover_or_str_mover,
+    needs_int_or_str_mover,
+    needs_mover,
+)
 
 from blueapi.config import (
     ApplicationConfig,
@@ -51,7 +59,11 @@ from blueapi.config import (
 )
 from blueapi.core import BlueskyContext, is_bluesky_compatible_device
 from blueapi.core.bluesky_types import BlueapiDevice
-from blueapi.core.context import generic_bounds, qualified_name
+from blueapi.core.context import (
+    generic_bounds,
+    is_compatible_args,
+    qualified_name,
+)
 from blueapi.core.protocols import DeviceConnectResult, DeviceManager
 from blueapi.utils.invalid_config_error import InvalidConfigError
 
@@ -781,6 +793,403 @@ def test_generic_bounds_with_no_bases():
     assert generic_bounds(derived_instance, Base) == ()  # type: ignore
 
 
+T_inv = TypeVar("T_inv")
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+
+class Both(Generic[T_inv]): ...
+
+
+class Producer(Generic[T_co]): ...
+
+
+class Consumer(Generic[T_contra]): ...
+
+
+def device_declaring(base: Any, type_argument: Any) -> Any:
+    """An instance of a class that directly declares base[type_argument]"""
+    return new_class("Declared", (base[type_argument],))()
+
+
+# Each case is the type argument declared by a device and whether that device
+# satisfies an annotation whose type argument is int
+type_argument_ids = ["subtype", "same", "supertype", "unrelated"]
+
+
+@pytest.mark.parametrize(
+    "declared,compatible",
+    [(bool, True), (int, True), (object, False), (str, False)],
+    ids=type_argument_ids,
+)
+def test_covariant_type_argument_accepts_subtypes(declared: type, compatible: bool):
+    device = device_declaring(Producer, declared)
+    assert is_compatible_args(device, Producer, (int,)) is compatible
+
+
+@pytest.mark.parametrize(
+    "declared,compatible",
+    [(bool, False), (int, True), (object, True), (str, False)],
+    ids=type_argument_ids,
+)
+def test_contravariant_type_argument_accepts_supertypes(
+    declared: type, compatible: bool
+):
+    device = device_declaring(Consumer, declared)
+    assert is_compatible_args(device, Consumer, (int,)) is compatible
+
+
+@pytest.mark.parametrize(
+    "declared,compatible",
+    [(bool, True), (int, True), (object, False), (str, False)],
+    ids=type_argument_ids,
+)
+def test_invariant_type_argument_accepts_subtypes(declared: type, compatible: bool):
+    # Lenient on purpose: protocols that only produce values, such as bluesky's
+    # Readable, are often declared invariant
+    device = device_declaring(Both, declared)
+    assert is_compatible_args(device, Both, (int,)) is compatible
+
+
+class Converter(Generic[T_contra, T_co]): ...
+
+
+@pytest.mark.parametrize(
+    "consumes,produces,compatible",
+    [
+        (int, int, True),
+        (object, bool, True),
+        (bool, bool, False),
+        (object, object, False),
+    ],
+)
+def test_each_type_argument_is_compared_with_its_own_variance(
+    consumes: type, produces: type, compatible: bool
+):
+    device = device_declaring(Converter, (consumes, produces))
+    type_arguments = get_args(Converter[int, int])
+    assert is_compatible_args(device, Converter, type_arguments) is compatible
+
+
+class Subscriptable:
+    __class_getitem__ = classmethod(GenericAlias)
+
+
+@pytest.mark.parametrize(
+    "declared,compatible",
+    [(bool, True), (int, True), (object, False), (str, False)],
+    ids=type_argument_ids,
+)
+def test_type_argument_without_type_parameter_accepts_subtypes(
+    declared: type, compatible: bool
+):
+    # A class can take type arguments without declaring any type parameters
+    device = device_declaring(Subscriptable, declared)
+    assert is_compatible_args(device, Subscriptable, (int,)) is compatible
+
+
+@pytest.mark.parametrize("base", [Both, Producer, Consumer])
+def test_device_declaring_any_is_compatible(base: type):
+    assert is_compatible_args(device_declaring(base, Any), base, (int,))
+
+
+@pytest.mark.parametrize("base", [Both, Producer, Consumer])
+def test_device_without_type_arguments_is_compatible(base: type):
+    assert is_compatible_args(new_class("Undeclared", (base,))(), base, (int,))
+
+
+@pytest.mark.parametrize("base", [Both, Producer, Consumer])
+def test_annotation_without_type_arguments_accepts_any_device(base: type):
+    assert is_compatible_args(device_declaring(base, str), base, None)
+
+
+@pytest.mark.parametrize("base", [Both, Producer])
+@pytest.mark.parametrize("declared", [str, int | str, list[int]])
+def test_produced_type_annotated_with_any_accepts_any_device(base: Any, declared: Any):
+    type_arguments = get_args(base[Any])
+    assert is_compatible_args(device_declaring(base, declared), base, type_arguments)
+
+
+# An annotation of Any for a type that a device consumes means that the device
+# could be given anything
+@pytest.mark.parametrize(
+    "declared,compatible",
+    [(Any, True), (object, True), (str, False), (int | str, False)],
+)
+def test_consumed_type_annotated_with_any_needs_device_that_takes_anything(
+    declared: Any, compatible: bool
+):
+    device = device_declaring(Consumer, declared)
+    type_arguments = get_args(Consumer[Any])
+    assert is_compatible_args(device, Consumer, type_arguments) is compatible
+
+
+@pytest.mark.parametrize(
+    "declared,expected,compatible",
+    [
+        (int, int | str, True),
+        (int | str, int | str, True),
+        (int | bytes, int | str, False),
+        (int | str, int, False),
+    ],
+)
+def test_covariant_union_type_argument_must_be_covered_by_annotation(
+    declared: Any, expected: Any, compatible: bool
+):
+    device = device_declaring(Producer, declared)
+    assert is_compatible_args(device, Producer, (expected,)) is compatible
+
+
+@pytest.mark.parametrize(
+    "declared,compatible", [(list[int], True), (list[bool], False)]
+)
+def test_type_arguments_that_cannot_be_compared_must_be_equal(
+    declared: Any, compatible: bool
+):
+    device = device_declaring(Producer, declared)
+    assert is_compatible_args(device, Producer, (list[int],)) is compatible
+
+
+class Mover:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def set(self, value: Any) -> Status: ...
+
+
+class AnyMover(Mover, Movable[Any]): ...
+
+
+class BoolMover(Mover, Movable[bool]): ...
+
+
+class IntMover(Mover, Movable[int]): ...
+
+
+class StrMover(Mover, Movable[str]): ...
+
+
+class IntOrStrMover(Mover, Movable[int | str]): ...
+
+
+class ObjectMover(Mover, Movable[object]): ...
+
+
+def device_passed_to(context: BlueskyContext, plan: PlanGenerator, mover: Mover) -> Any:
+    """The device that the plan would be run with when asked for the mover"""
+    context.register_device(mover)
+    context.register_plan(plan)
+    model = context.plans[plan.__name__].model
+    return dict(model.model_validate({"mover": mover.name}))["mover"]
+
+
+# bluesky declares Movable as contravariant in the type of value it is set to
+@pytest.mark.parametrize("mover_type", [AnyMover, IntMover, IntOrStrMover, ObjectMover])
+def test_movable_parameter_accepts_device_that_takes_wider_values(
+    empty_context: BlueskyContext, mover_type: type[Mover]
+):
+    mover = mover_type("mover")
+    assert device_passed_to(empty_context, needs_int_mover, mover) is mover
+
+
+def test_movable_parameter_rejects_device_that_takes_narrower_values(
+    empty_context: BlueskyContext,
+):
+    with pytest.raises(
+        ValidationError, match=r"is not of type bluesky.protocols.Movable\[int\]"
+    ):
+        device_passed_to(empty_context, needs_int_mover, BoolMover("mover"))
+
+
+@pytest.mark.parametrize(
+    "mover_type",
+    [Mover, AnyMover, BoolMover, IntMover, StrMover, IntOrStrMover, ObjectMover],
+)
+def test_movable_parameter_without_type_argument_accepts_any_mover(
+    empty_context: BlueskyContext, mover_type: type[Mover]
+):
+    mover = mover_type("mover")
+    assert device_passed_to(empty_context, needs_mover, mover) is mover
+
+
+# A plan that asks for Movable[Any] could set its device to anything
+@pytest.mark.parametrize("mover_type", [Mover, AnyMover, ObjectMover])
+def test_movable_of_any_accepts_device_that_takes_anything(
+    empty_context: BlueskyContext, mover_type: type[Mover]
+):
+    mover = mover_type("mover")
+    assert device_passed_to(empty_context, needs_any_mover, mover) is mover
+
+
+@pytest.mark.parametrize(
+    "mover_type,declared",
+    [
+        (BoolMover, "bool"),
+        (IntMover, "int"),
+        (StrMover, "str"),
+        (IntOrStrMover, r"int \| str"),
+    ],
+)
+def test_movable_of_any_rejects_device_that_takes_only_some_values(
+    empty_context: BlueskyContext, mover_type: type[Mover], declared: str
+):
+    with pytest.raises(
+        ValidationError,
+        match=(
+            r"is not of type bluesky\.protocols\.Movable\[typing\.Any\], "
+            rf"it is a bluesky\.protocols\.Movable\[{declared}\]"
+        ),
+    ):
+        device_passed_to(empty_context, needs_any_mover, mover_type("mover"))
+
+
+@pytest.mark.parametrize(
+    "mover_type", [AnyMover, IntMover, StrMover, IntOrStrMover, ObjectMover]
+)
+def test_union_of_movables_accepts_device_that_satisfies_any_member(
+    empty_context: BlueskyContext, mover_type: type[Mover]
+):
+    mover = mover_type("mover")
+    passed = device_passed_to(empty_context, needs_int_mover_or_str_mover, mover)
+    assert passed is mover
+
+
+def test_union_of_movables_rejects_device_that_satisfies_no_member(
+    empty_context: BlueskyContext,
+):
+    with pytest.raises(ValidationError, match="is not of type"):
+        device_passed_to(
+            empty_context, needs_int_mover_or_str_mover, BoolMover("mover")
+        )
+
+
+@pytest.mark.parametrize("mover_type", [AnyMover, IntOrStrMover, ObjectMover])
+def test_movable_of_union_accepts_device_that_takes_every_member(
+    empty_context: BlueskyContext, mover_type: type[Mover]
+):
+    mover = mover_type("mover")
+    assert device_passed_to(empty_context, needs_int_or_str_mover, mover) is mover
+
+
+@pytest.mark.parametrize(
+    "mover_type,declared", [(BoolMover, "bool"), (IntMover, "int"), (StrMover, "str")]
+)
+def test_movable_of_union_rejects_device_that_takes_only_some_members(
+    empty_context: BlueskyContext, mover_type: type[Mover], declared: str
+):
+    with pytest.raises(
+        ValidationError,
+        match=(
+            rf"Device mover \(.*{mover_type.__name__}\) is not of type "
+            r"bluesky\.protocols\.Movable\[int \| str\], "
+            rf"it is a bluesky\.protocols\.Movable\[{declared}\]"
+        ),
+    ):
+        device_passed_to(empty_context, needs_int_or_str_mover, mover_type("mover"))
+
+
+def test_generated_schema_with_union_type_argument(empty_context: BlueskyContext):
+    empty_context.register_plan(needs_int_or_str_mover)
+    schema = empty_context.plans["needs_int_or_str_mover"].model.model_json_schema()
+    assert schema["properties"]["mover"]["types"] == ["int | str"]
+
+
+class LaterMover(Mover, Movable["Later"]): ...
+
+
+class Later: ...
+
+
+def test_rejected_device_with_unnamed_type_argument_is_described(
+    empty_context: BlueskyContext,
+):
+    with pytest.raises(ValidationError, match=r"it is a .*Movable\[.*Later.*\]"):
+        device_passed_to(empty_context, needs_int_mover, LaterMover("mover"))
+
+
+GENERIC_MODULE = "tests.unit_tests.core.fake_generic_module"
+ALL_MOVERS = {
+    "undeclared_mover",
+    "any_mover",
+    "bool_mover",
+    "int_mover",
+    "str_mover",
+    "int_or_str_mover",
+    "object_mover",
+}
+# The devices in the module that each of its plans accepts as the mover
+ACCEPTED_MOVERS = {
+    "needs_mover": ALL_MOVERS,
+    "needs_any_mover": {"undeclared_mover", "any_mover", "object_mover"},
+    "needs_int_mover": ALL_MOVERS - {"bool_mover", "str_mover"},
+    "needs_int_mover_or_str_mover": ALL_MOVERS - {"bool_mover"},
+    "needs_int_or_str_mover": ALL_MOVERS - {"bool_mover", "int_mover", "str_mover"},
+}
+
+
+@pytest.fixture
+def generic_context() -> BlueskyContext:
+    """Devices and plans loaded from a module in the same way as the server"""
+    context = BlueskyContext()
+    context.with_config(
+        EnvironmentConfig(
+            sources=[
+                DeviceManagerSource(module=GENERIC_MODULE),
+                PlanSource(module=GENERIC_MODULE),
+            ]
+        )
+    )
+    return context
+
+
+def test_generic_devices_and_plans_are_loaded(generic_context: BlueskyContext):
+    assert generic_context.devices.keys() == ALL_MOVERS
+    assert generic_context.plans.keys() == ACCEPTED_MOVERS.keys()
+
+
+@pytest.mark.parametrize(
+    "plan,mover",
+    [
+        (plan, mover)
+        for plan in ACCEPTED_MOVERS
+        for mover in sorted(ACCEPTED_MOVERS[plan])
+    ],
+)
+def test_plan_accepts_loaded_device(
+    generic_context: BlueskyContext, plan: str, mover: str
+):
+    validated = generic_context.plans[plan].model.model_validate({"mover": mover})
+    assert dict(validated)["mover"] is generic_context.devices[mover].device
+
+
+@pytest.mark.parametrize(
+    "plan,mover",
+    [
+        (plan, mover)
+        for plan in ACCEPTED_MOVERS
+        for mover in sorted(ALL_MOVERS - ACCEPTED_MOVERS[plan])
+    ],
+)
+def test_plan_rejects_loaded_device(
+    generic_context: BlueskyContext, plan: str, mover: str
+):
+    with pytest.raises(ValidationError, match="is not of type"):
+        generic_context.plans[plan].model.model_validate({"mover": mover})
+
+
+@pytest.mark.parametrize("plan", ACCEPTED_MOVERS)
+def test_schema_offers_the_loaded_devices_that_plan_accepts(
+    generic_context: BlueskyContext, plan: str
+):
+    schema = generic_context.plans[plan].model.model_json_schema()
+    mover = schema["properties"]["mover"]
+    # A union of device types offers the devices of each of its members
+    offered = [
+        name for member in mover.get("anyOf", [mover]) for name in member["enum"]
+    ]
+    assert set(offered) == ACCEPTED_MOVERS[plan]
+
+
 T = TypeVar("T")
 
 
@@ -806,6 +1215,12 @@ qualified_name_test_data = [
     (T, "Any"),
     (GenericClass, "core.test_context.GenericClass"),
     (OuterClass.InnerClass, "core.test_context.OuterClass.InnerClass"),
+    (int | str, "int | str"),
+    (int | CustomClass | None, "int | core.test_context.CustomClass | NoneType"),
+    (
+        Movable[int] | Movable[str],
+        "bluesky.protocols.Movable | bluesky.protocols.Movable",
+    ),
 ]
 
 

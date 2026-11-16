@@ -1,9 +1,10 @@
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import InitVar, dataclass, field, fields, is_dataclass
 from importlib import import_module, metadata
 from inspect import Parameter, isclass, signature
+from itertools import repeat
 from types import ModuleType, NoneType, UnionType
 from typing import (
     Any,
@@ -79,22 +80,77 @@ def generic_bounds(val: Device, target: type) -> tuple[type, ...]:
     return ()
 
 
+def _contravariant_parameters(target: type) -> Iterator[bool]:
+    """
+    Whether each type parameter of the target, in order, is declared contravariant.
+
+    Continues with False indefinitely, as a class can be given more type arguments
+    than it has type parameters, e.g. if it only defines __class_getitem__.
+    """
+    for parameter in getattr(target, "__parameters__", ()):
+        yield getattr(parameter, "__contravariant__", False)
+    yield from repeat(False)
+
+
+def is_union(target: Any) -> bool:
+    return get_origin(target) in (Union, UnionType)
+
+
+def _is_subtype(sub: Any, sup: Any) -> bool:
+    """
+    Whether a value of type sub can be used where one of type sup is expected, as
+    far as that can be told at run time.
+
+    Any and type variables are compatible with everything, and everything can be
+    used as an object. Types that cannot be compared, e.g. list[int] with
+    list[bool], are only compatible if equal.
+    """
+    if (
+        sub is Any
+        or sup is Any
+        or sup is object
+        or type(sub) is TypeVar
+        or type(sup) is TypeVar
+        or sub == sup
+    ):
+        return True
+    if is_union(sub):
+        return all(_is_subtype(member, sup) for member in get_args(sub))
+    if is_union(sup):
+        return any(_is_subtype(sub, member) for member in get_args(sup))
+    try:
+        return issubclass(sub, sup)
+    except TypeError:
+        return False
+
+
 def is_compatible_args(val: Device, target: type, args: tuple[type, ...] | None):
     return (not args) or all(
-        actual is Any
-        or type(actual) is TypeVar
-        or type(expected) is TypeVar
-        or expected == actual
-        or issubclass(actual, expected)
-        for expected, actual in zip(args, generic_bounds(val, target), strict=False)
+        # A device must accept everything it could be given for a type that it
+        # consumes, e.g. the value passed to Movable.set, and provide nothing
+        # unexpected for any other type
+        _is_subtype(expected, actual) if consumed else _is_subtype(actual, expected)
+        for expected, actual, consumed in zip(
+            # Asking for Any is asking for a device that works with everything,
+            # whereas a device that declares Any is trusted to work with anything
+            (object if arg is Any else arg for arg in args),
+            generic_bounds(val, target),
+            _contravariant_parameters(target),
+            strict=False,
+        )
     )
 
 
 def qualified_name(target: type) -> str:
-    module_name = f"{target.__module__}." if target.__module__ != "builtins" else ""
-    name = target.__qualname__ if hasattr(target, "__qualname__") else target.__name__
+    if is_union(target):
+        return " | ".join(qualified_name(member) for member in get_args(target))
     if isinstance(target, TypeVar):
         return "Any"
+    name = getattr(target, "__qualname__", None) or getattr(target, "__name__", None)
+    if name is None:
+        # Not a class or an alias of one, e.g. an unresolved forward reference
+        return str(target)
+    module_name = f"{target.__module__}." if target.__module__ != "builtins" else ""
     return f"{module_name}{name}"
 
 
@@ -420,14 +476,22 @@ class BlueskyContext:
                 ) -> CoreSchema:
                     def valid(value):
                         val = self.find_device(value)
+                        origin = cls.origin or target
                         if not val:
                             raise ValueError(f"Device {value} cannot be found")
-                        elif not is_compatible(val, cls.origin or target, cls.args):
+                        elif not is_compatible(val, origin, cls.args):
                             actual = qualified_name(type(val))
                             required = qualified_generic_name(target)
-                            raise ValueError(
+                            message = (
                                 f"Device {value} ({actual}) is not of type {required}"
                             )
+                            if declared := generic_bounds(val, origin):
+                                # Right kind of device, wrong type arguments
+                                names = ", ".join(qualified_name(d) for d in declared)
+                                message += (
+                                    f", it is a {qualified_name(origin)}[{names}]"
+                                )
+                            raise ValueError(message)
                         return val
 
                     return core_schema.no_info_after_validator_function(
@@ -446,7 +510,9 @@ class BlueskyContext:
                         [
                             name
                             for name, entry in self.devices.items()
-                            if isinstance(entry.device, cls.origin or target)
+                            if is_compatible(
+                                entry.device, cls.origin or target, cls.args
+                            )
                         ]
                     )
                     if cls.args:
