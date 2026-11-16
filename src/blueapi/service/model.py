@@ -1,7 +1,7 @@
 import uuid
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, get_args
 
 from bluesky.protocols import HasName
 from pydantic import Field
@@ -9,7 +9,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from blueapi.config import OIDCConfig
 from blueapi.core import BLUESKY_PROTOCOLS, Device, Plan
-from blueapi.core.context import generic_bounds
+from blueapi.core.context import generic_bounds, is_union
 from blueapi.utils import BlueapiBaseModel
 from blueapi.worker import WorkerState
 from blueapi.worker.task_worker import TaskWorker, TrackableTask
@@ -41,12 +41,19 @@ class DeviceModel(BlueapiBaseModel):
         return cls(name=name, protocols=list(_protocol_info(device)))
 
 
+def _type_name(target: Any) -> str:
+    if is_union(target):
+        return " | ".join(_type_name(member) for member in get_args(target))
+    # Not everything has a name, e.g. an unresolved forward reference
+    return getattr(target, "__name__", None) or str(target)
+
+
 def _protocol_info(device: Device) -> Iterable[ProtocolInfo]:
     for protocol in BLUESKY_PROTOCOLS:
         if isinstance(device, protocol):
             yield ProtocolInfo(
                 name=protocol.__name__,
-                types=[arg.__name__ for arg in generic_bounds(device, protocol)],
+                types=[_type_name(arg) for arg in generic_bounds(device, protocol)],
             )
 
 
